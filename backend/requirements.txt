@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-dotenv
+motor
+transformers
+datasets
+torch
+huggingface-hub
+openai
+python-multipart
