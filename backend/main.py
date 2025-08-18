@@ -23,3 +23,21 @@ from dotenv import load_dotenv
 from openai import OpenAI
 from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
 from datasets import Dataset
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) ENV + CLIENT SETUP
+# ─────────────────────────────────────────────────────────────────────────────
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+if HF_API_TOKEN:
+    logging.info("✅ HF_API_TOKEN loaded")
+else:
+    logging.warning("⚠️ HF_API_TOKEN not set — HF inference disabled")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    logging.error("❌ OPENAI_API_KEY is required for GPT-4 fallback")
+    raise RuntimeError("Missing OPENAI_API_KEY")
+client_openai = OpenAI(api_key=OPENAI_API_KEY)
