@@ -41,3 +41,43 @@ if not OPENAI_API_KEY:
     logging.error("❌ OPENAI_API_KEY is required for GPT-4 fallback")
     raise RuntimeError("Missing OPENAI_API_KEY")
 client_openai = OpenAI(api_key=OPENAI_API_KEY)
+# in-memory stores
+chat_cfg: Dict[str, Dict[str, Any]] = {}
+train_progress: Dict[str, Dict[str, Any]] = {}
+
+# public models (no gated repos)
+PUBLIC_MODELS = [
+    "mistralai/mistral-7b",
+    "tiiuae/falcon-40b",
+    "EleutherAI/gpt-j-6B",
+    "EleutherAI/gpt-neo-2.7B",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) FASTAPI SETUP
+# ─────────────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Ailo Forge", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) SCHEMAS
+# ─────────────────────────────────────────────────────────────────────────────
+class ModifyChat(BaseModel):
+    model_id:    str   = Field(..., alias="modelId")
+    temperature: float
+    token_limit: int   = Field(..., alias="tokenLimit")
+    instructions:str   = Field("", alias="instructions")
+    class Config:
+        allow_population_by_alias = True
+        allow_population_by_field_name = True
+
+class RunChat(BaseModel):
+    model_id: str   = Field(..., alias="modelId")
+    prompt:   str
+    class Config:
+        allow_population_by_alias = True
+        allow_population_by_field_name = True
