@@ -81,3 +81,60 @@ class RunChat(BaseModel):
     class Config:
         allow_population_by_alias = True
         allow_population_by_field_name = True
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/")
+async def healthcheck():
+    return {"status":"ok","message":"Ailo Forge backend is live"}
+
+@app.get("/models")
+async def list_models():
+    return {"models": PUBLIC_MODELS}
+
+@app.post("/modify-file")
+async def modify_file(req: ModifyChat):
+    chat_cfg[req.model_id] = {
+        "temperature": req.temperature,
+        "max_tokens":  req.token_limit,
+        "instructions": req.instructions,
+    }
+    return {"success": True, "message": "✅ Model has been modified!"}
+
+@app.post("/run")
+async def run_chat(req: RunChat):
+    cfg = chat_cfg.get(req.model_id, {})
+    temp    = cfg.get("temperature", 0.7)
+    max_tok = cfg.get("max_tokens", 150)
+    instr   = cfg.get("instructions", "")
+
+    # build full prompt
+    full_input = instr.strip()
+    if full_input:
+        full_input += "\n" + req.prompt
+    else:
+        full_input = req.prompt
+
+    # 1) HF Inference
+    if HF_API_TOKEN:
+        hf_url = f"https://api-inference.huggingface.co/models/{req.model_id}"
+        headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+        payload = {
+            "inputs": full_input,
+            "parameters": {"temperature": temp, "max_new_tokens": max_tok},
+        }
+        try:
+            r = requests.post(hf_url, headers=headers, json=payload, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            # extract generated_text
+            if isinstance(data, list) and "generated_text" in data[0]:
+                text = data[0]["generated_text"]
+            elif isinstance(data, dict) and "generated_text" in data:
+                text = data["generated_text"]
+            else:
+                text = data.get("generated_text", str(data))
+            return {"success": True, "response": text}
+        except Exception as e:
+            logging.warning(f"HF Inference error for {req.model_id}: {e} — falling back to OpenAI")
+
