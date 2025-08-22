@@ -51,6 +51,49 @@ PUBLIC_MODELS = [
     "tiiuae/falcon-40b",
     "EleutherAI/gpt-j-6B",
     "EleutherAI/gpt-neo-2.7B",
+ # 2) OpenAI fallback
+    messages = []
+    if instr:
+        messages.append({"role":"system","content":instr})
+    messages.append({"role":"user","content":req.prompt})
+    try:
+        resp = client_openai.chat.completions.create(
+            model="gpt-4",
+            messages=messages,
+            temperature=temp,
+            max_tokens=max_tok,
+        )
+        text = resp.choices[0].message.content.strip()
+        return {"success": True, "response": text}
+    except Exception as e:
+        logging.error(f"OpenAI GPT-4 error: {e}")
+        raise HTTPException(502, detail="Both HF and OpenAI calls failed.")
+
+@app.post("/train")
+async def train_model(
+    repo_id: str = Form(...),
+    files: List[UploadFile] = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    texts = []
+    for f in files:
+        b = await f.read()
+        if not b.startswith((b"\xFF\xD8", b"\x89PNG")):
+            texts.append(b.decode("utf-8", errors="ignore"))
+    if not texts:
+        raise HTTPException(400, detail="No valid text provided")
+
+    job = str(uuid.uuid4())
+    train_progress[job] = {"percent": 0, "status": "in_progress"}
+    background_tasks.add_task(_run_training, job, repo_id, texts)
+    return {"job_id": job, "status": "training_started"}
+
+@app.get("/progress/{job_id}")
+async def get_progress(job_id: str):
+    if job_id not in train_progress:
+        raise HTTPException(404, detail="Job not found")
+    return train_progress[job_id]
+
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
