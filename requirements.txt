@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pydantic
+python-dotenv
+requests
+boto3
+redis
+transformers
+datasets
+accelerate
+peft
+bitsandbytes
+openai
