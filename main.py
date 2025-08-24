@@ -2,11 +2,13 @@
 import os, json, uuid, time, logging, shutil, tempfile
 from typing import Dict, Any, List, Optional
 
-import boto3, requests, redis
+import requests
+import boto3
+import redis
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field, ConfigDict
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
@@ -14,22 +16,33 @@ from peft import PeftModel
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("nspire")
 
 # ── Env ──────────────────────────────────────────────────────────────────────
-ALLOW_ORIGINS        = os.getenv("ALLOW_ORIGINS", "*")
-RUNPOD_API_KEY       = os.getenv("RUNPOD_API_KEY")
-RUNPOD_ENDPOINT_ID   = os.getenv("RUNPOD_ENDPOINT_ID")
+ALLOW_ORIGINS         = os.getenv("ALLOW_ORIGINS", "*")
+RUNPOD_API_KEY        = os.getenv("RUNPOD_API_KEY")
+RUNPOD_ENDPOINT_ID    = os.getenv("RUNPOD_ENDPOINT_ID")
 
-S3_BUCKET            = os.getenv("S3_BUCKET")
-S3_ENDPOINT          = os.getenv("S3_ENDPOINT")
-AWS_REGION           = os.getenv("AWS_REGION", "auto")
-AWS_ACCESS_KEY_ID    = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY= os.getenv("AWS_SECRET_ACCESS_KEY")
+S3_BUCKET             = os.getenv("S3_BUCKET")
+S3_ENDPOINT           = os.getenv("S3_ENDPOINT")
+AWS_REGION            = os.getenv("AWS_REGION", "auto")
+AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 
-REDIS_URL            = os.getenv("REDIS_URL", "")
+REDIS_URL             = os.getenv("REDIS_URL", "")
 
-HF_API_TOKEN         = os.getenv("HF_API_TOKEN")     # optional (HF Inference)
-OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY")   # optional (OpenAI fallback)
+HF_API_TOKEN          = os.getenv("HF_API_TOKEN")     # optional (HF Hosted Inference)
+OPENAI_API_KEY        = os.getenv("OPENAI_API_KEY")   # optional (OpenAI fallback)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+CACHE_DIR = "/tmp/nspire_models"; os.makedirs(CACHE_DIR, exist_ok=True)
+
+PUBLIC_MODELS = [
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    "mistralai/Mistral-7B-v0.1",
+    "tiiuae/falcon-7b",
+    "EleutherAI/gpt-j-6B",
+]
 
 # ── Clients ──────────────────────────────────────────────────────────────────
 s3 = None
@@ -44,21 +57,11 @@ if S3_BUCKET and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY and S3_ENDPOINT:
 
 rdb = redis.from_url(REDIS_URL) if REDIS_URL else None
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CACHE_DIR = "/tmp/nspire_models"; os.makedirs(CACHE_DIR, exist_ok=True)
-
-PUBLIC_MODELS = [
-    "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-    "mistralai/Mistral-7B-v0.1",
-    "tiiuae/falcon-7b",
-    "EleutherAI/gpt-j-6B",
-]
-
 # in-proc registry of loaded pipelines
 local_models: Dict[str, Dict[str, Any]] = {}
 
 # ── App + CORS ───────────────────────────────────────────────────────────────
-app = FastAPI(title="nspire API", version="1.1.0")
+app = FastAPI(title="Nspire API", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if ALLOW_ORIGINS == "*" else [ALLOW_ORIGINS],
@@ -69,48 +72,40 @@ app.add_middleware(
 
 # ── Session (no login — per-browser header) ──────────────────────────────────
 def require_session(x_session_id: Optional[str] = Header(None)) -> str:
-    sid = x_session_id or f"anon-{uuid.uuid4()}"
-    return sid
+    return x_session_id or f"anon-{uuid.uuid4()}"
 
-# ── Schemas ──────────────────────────────────────────────────────────────────
+# ── Schemas (Pydantic v2-safe) ───────────────────────────────────────────────
 class ModifyChat(BaseModel):
-    model_id: str = Field(..., alias="modelId")
+    model_config = ConfigDict(populate_by_name=True, protected_namespaces=())
+    modelId: str = Field(..., alias="modelId")
     temperature: float = 0.7
-    token_limit: int = Field(256, alias="tokenLimit")
+    tokenLimit: int = Field(256, alias="tokenLimit")
     instructions: str = Field("", alias="instructions")
-    top_p: Optional[float] = Field(None, alias="topP")
-    top_k: Optional[int]   = Field(None, alias="topK")
-    stop: Optional[List[str]] = None
-    class Config:
-        allow_population_by_alias = True
-        allow_population_by_field_name = True
+    topP: float | None = Field(None, alias="topP")
+    topK: int | None = Field(None, alias="topK")
+    stop: List[str] | None = None
 
 class RunChat(BaseModel):
-    model_id: str = Field(..., alias="modelId")
+    model_config = ConfigDict(populate_by_name=True, protected_namespaces=())
+    modelId: str = Field(..., alias="modelId")
     prompt: str
-    class Config:
-        allow_population_by_alias = True
-        allow_population_by_field_name = True
 
-# ── Redis keys ────────────────────────────────────────────────────────────────
+# ── Redis keys & helpers ─────────────────────────────────────────────────────
 def _cfg_key(sid: str, mid: str) -> str:  return f"cfg:{sid}:{mid}"
 def _job_key(sid: str, jid: str) -> str:  return f"job:{sid}:{jid}"
 def _models_key(sid: str) -> str:         return f"models:{sid}"
 
 def _save_cfg(sid: str, mid: str, cfg: Dict[str,Any]):
-    if rdb:
-        rdb.hset(_cfg_key(sid,mid), mapping=cfg)
+    if rdb: rdb.hset(_cfg_key(sid,mid), mapping=cfg)
 
 def _load_cfg(sid: str, mid: str) -> Dict[str,Any]:
     if not rdb: return {}
     raw = rdb.hgetall(_cfg_key(sid,mid))
     if not raw: return {}
-    out = {k.decode(): (v.decode() if isinstance(v,bytes) else v) for k,v in raw.items()}
-    return out
+    return {k.decode(): (v.decode() if isinstance(v,bytes) else v) for k,v in raw.items()}
 
 def _register_model(sid: str, mid: str, meta: Dict[str,Any]):
-    if rdb:
-        rdb.hset(_models_key(sid), mid, json.dumps(meta))
+    if rdb: rdb.hset(_models_key(sid), mid, json.dumps(meta))
 
 def _list_models(sid: str) -> Dict[str,Any]:
     if not rdb: return {}
@@ -149,7 +144,7 @@ def _gen_kwargs(cfg: Dict[str,Any]) -> Dict[str,Any]:
         "max_new_tokens": int(cfg.get("max_tokens", 256)),
         "temperature": float(cfg.get("temperature", 0.7)),
         "do_sample": True,
-        "return_full_text": False
+        "return_full_text": False,
     }
     if cfg.get("top_p") not in ("", None): out["top_p"] = float(cfg["top_p"])
     if cfg.get("top_k") not in ("", None): out["top_k"] = int(cfg["top_k"])
@@ -158,16 +153,14 @@ def _gen_kwargs(cfg: Dict[str,Any]) -> Dict[str,Any]:
     return out
 
 def _ensure_loaded_finetune(model_id: str, meta: Dict[str,Any]):
-    """Load a fine-tuned model from S3 into a local pipeline (cached)."""
     if model_id in local_models: return
     local_path = os.path.join(CACHE_DIR, model_id)
     if not os.path.isdir(local_path):
         uri = meta["s3_uri"]; assert uri.startswith("s3://")
         _,_,rest = uri.partition("s3://"); bucket,_,prefix = rest.partition("/")
-        logging.info(f"Downloading {uri} to {local_path} …")
+        log.info(f"Downloading {uri} → {local_path}")
         _download_prefix(local_path, bucket, prefix)
 
-    # meta override (optional)
     meta_path = os.path.join(local_path,"meta.json")
     if os.path.exists(meta_path):
         try: meta.update(json.load(open(meta_path)))
@@ -195,12 +188,11 @@ def _ensure_loaded_finetune(model_id: str, meta: Dict[str,Any]):
     model.eval()
     pipe = pipeline("text-generation", model=model, tokenizer=tok, device=(0 if DEVICE=="cuda" else -1))
     local_models[model_id] = {"pipe": pipe, "meta": meta, "source": "finetune-local"}
-    logging.info(f"Loaded fine-tuned model {model_id} on {DEVICE}")
+    log.info(f"Loaded fine-tuned model {model_id} on {DEVICE}")
 
 def _ensure_loaded_base(model_id: str):
-    """Load a public HF model repo id into a local pipeline (cached)."""
     if model_id in local_models: return
-    logging.info(f"Loading base HF model {model_id} locally …")
+    log.info(f"Loading base HF model {model_id} locally …")
     tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     model = AutoModelForCausalLM.from_pretrained(
@@ -210,9 +202,9 @@ def _ensure_loaded_base(model_id: str):
     model.eval()
     pipe = pipeline("text-generation", model=model, tokenizer=tok, device=(0 if DEVICE=="cuda" else -1))
     local_models[model_id] = {"pipe": pipe, "meta": {"source": "hf-local"}}
-    logging.info(f"Loaded {model_id} on {DEVICE}")
+    log.info(f"Loaded {model_id} on {DEVICE}")
 
-# ── RunPod helper ────────────────────────────────────────────────────────────
+# ── RunPod wrapper ───────────────────────────────────────────────────────────
 def _rp(path: str, payload: Dict[str,Any]) -> Dict[str,Any]:
     if not (RUNPOD_API_KEY and RUNPOD_ENDPOINT_ID):
         raise HTTPException(500, "RunPod not configured")
@@ -224,55 +216,50 @@ def _rp(path: str, payload: Dict[str,Any]) -> Dict[str,Any]:
 # ── Routes ──────────────────────────────────────────────────────────────────
 @app.get("/")
 def health():
-    return {"ok": True, "device": DEVICE, "message": "nspire API live"}
+    return {"ok": True, "device": DEVICE, "message": "Nspire API live"}
 
 @app.get("/models")
 def models(session_id: str = Depends(require_session)):
     return {"baseModels": PUBLIC_MODELS, "localModels": _list_models(session_id)}
 
-# save config + (optionally) prewarm base model
 @app.post("/modify-file")
 def modify(
     req: ModifyChat,
     session_id: str = Depends(require_session),
-    prewarm: bool = Query(True)  # pre-load base model to avoid 502 on first chat
+    prewarm: bool = Query(True)
 ):
+    mid = req.modelId
     cfg = {
         "temperature": req.temperature,
-        "max_tokens": req.token_limit,
+        "max_tokens": req.tokenLimit,
         "instructions": req.instructions,
-        "top_p": req.top_p if req.top_p is not None else "",
-        "top_k": req.top_k if req.top_k is not None else "",
+        "top_p": req.topP if req.topP is not None else "",
+        "top_k": req.topK if req.topK is not None else "",
         "stop": json.dumps(req.stop) if req.stop else ""
     }
-    _save_cfg(session_id, req.model_id, cfg)
+    _save_cfg(session_id, mid, cfg)
 
-    # optional: prewarm base model (no-op for fine-tunes)
-    if prewarm and req.model_id not in _list_models(session_id):
+    # prewarm base (no-op for FT models)
+    if prewarm and mid not in _list_models(session_id):
         try:
-            _ensure_loaded_base(req.model_id)
+            _ensure_loaded_base(mid)
         except Exception as e:
-            logging.warning(f"Prewarm failed for {req.model_id}: {e}")
+            log.warning(f"Prewarm failed for {mid}: {e}")
 
-    return {"success": True, "modelId": req.model_id, "config": cfg}
+    return {"success": True, "modelId": mid, "config": cfg}
 
-# return current config (JSON)
 @app.get("/config")
 def get_config(model_id: str = Query(...), session_id: str = Depends(require_session)):
-    cfg = _load_cfg(session_id, model_id)
-    return {"modelId": model_id, "config": cfg}
+    return {"modelId": model_id, "config": _load_cfg(session_id, model_id)}
 
-# download config as a file (for the “advanced” feel)
 @app.get("/config/download")
 def download_config(model_id: str = Query(...), session_id: str = Depends(require_session)):
     cfg = _load_cfg(session_id, model_id)
-    if not cfg:
-        raise HTTPException(404, "No config found")
+    if not cfg: raise HTTPException(404, "No config found")
     tmp = tempfile.NamedTemporaryFile("w+", delete=False, suffix=f"-{model_id}-config.json")
     json.dump(cfg, tmp); tmp.flush(); tmp.close()
     return FileResponse(tmp.name, media_type="application/json", filename=f"{model_id}-config.json")
 
-# train via RunPod
 @app.post("/train")
 async def train(
     base_model_id: str = Form(...),
@@ -306,11 +293,9 @@ async def train(
 
 @app.get("/progress/{job_id}")
 def progress(job_id: str, session_id: str = Depends(require_session)):
-    if not rdb:
-        raise HTTPException(500, "Redis required")
+    if not rdb: raise HTTPException(500, "Redis required")
     h = rdb.hgetall(_job_key(session_id, job_id))
-    if not h:
-        raise HTTPException(404, "Job not found")
+    if not h: raise HTTPException(404, "Job not found")
     rp_id = h[b"rp_job_id"].decode()
 
     r = requests.post(
@@ -340,64 +325,62 @@ def progress(job_id: str, session_id: str = Depends(require_session)):
         rdb.hset(_job_key(session_id, job_id), mapping={"status":"failed"})
         return {"status":"failed"}
 
-# explicit load of a local fine-tune (optional)
 @app.get("/load-local")
 def load_local(model_id: str = Query(...), session_id: str = Depends(require_session)):
     models = _list_models(session_id)
     meta = models.get(model_id)
-    if not meta:
-        raise HTTPException(404, "Model not found for this session")
+    if not meta: raise HTTPException(404, "Model not found for this session")
     _ensure_loaded_finetune(model_id, meta)
     return {"success": True, "loaded": model_id}
 
-# download the trained model artifacts as a zip
 @app.get("/download-model")
 def download_model(model_id: str = Query(...), session_id: str = Depends(require_session)):
     models = _list_models(session_id)
     meta = models.get(model_id)
-    if not meta:
-        raise HTTPException(404, "Model not found for this session")
+    if not meta: raise HTTPException(404, "Model not found for this session")
     s3_uri = meta.get("s3_uri")
-    if not s3_uri:
-        raise HTTPException(400, "No model artifacts available")
+    if not s3_uri: raise HTTPException(400, "No model artifacts available")
     _, _, path = s3_uri.partition("s3://")
     bucket, _, prefix = path.partition("/")
     tmp_dir = tempfile.mkdtemp(prefix=f"{model_id}_")
     _download_prefix(tmp_dir, bucket, prefix)
     zip_path = os.path.join(tempfile.gettempdir(), f"{model_id}.zip")
-    # make_archive writes zip_path without the .zip suffix provided
     base = zip_path[:-4] if zip_path.endswith(".zip") else zip_path
     shutil.make_archive(base, "zip", tmp_dir)
     return FileResponse(base + ".zip", media_type="application/zip", filename=f"{model_id}.zip")
 
-# chat inference
 @app.post("/run")
 def run_chat(req: RunChat, session_id: str = Depends(require_session)):
-    cfg = _load_cfg(session_id, req.model_id)
+    mid = req.modelId
+    cfg = _load_cfg(session_id, mid)
     instr = cfg.get("instructions","")
 
-    # 1) local fine-tuned model
-    meta = _list_models(session_id).get(req.model_id)
+    # 1) fine-tuned local
+    meta = _list_models(session_id).get(mid)
     if meta:
-        _ensure_loaded_finetune(req.model_id, meta)
-        pipe = local_models[req.model_id]["pipe"]
+        _ensure_loaded_finetune(mid, meta)
+        pipe = local_models[mid]["pipe"]
         out = pipe(_build_prompt(instr, req.prompt), **_gen_kwargs(cfg))
         return {"success": True, "source": "finetune-local", "response": out[0]["generated_text"].strip()}
 
-    # 2) if we already prewarmed a base model locally, use it
-    if req.model_id in local_models:
-        pipe = local_models[req.model_id]["pipe"]
+    # 2) prewarmed base local
+    if mid in local_models:
+        pipe = local_models[mid]["pipe"]
         out = pipe(_build_prompt(instr, req.prompt), **_gen_kwargs(cfg))
         return {"success": True, "source": "hf-local", "response": out[0]["generated_text"].strip()}
 
     # 3) HF Hosted Inference
     if HF_API_TOKEN:
         try:
-            url = f"https://api-inference.huggingface.co/models/{req.model_id}"
+            url = f"https://api-inference.huggingface.co/models/{mid}"
             headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-            payload = {"inputs": _build_prompt(instr, req.prompt),
-                       "parameters": {"temperature": float(cfg.get("temperature",0.7)),
-                                      "max_new_tokens": int(cfg.get("max_tokens",256))}}
+            payload = {
+                "inputs": _build_prompt(instr, req.prompt),
+                "parameters": {
+                    "temperature": float(cfg.get("temperature",0.7)),
+                    "max_new_tokens": int(cfg.get("max_tokens",256))
+                }
+            }
             r = requests.post(url, headers=headers, json=payload, timeout=60)
             r.raise_for_status()
             data = r.json()
@@ -409,18 +392,18 @@ def run_chat(req: RunChat, session_id: str = Depends(require_session)):
                 text = str(data)
             return {"success": True, "source": "hf_inference", "response": text}
         except Exception as e:
-            logging.warning(f"HF inference failed: {e}")
+            log.warning(f"HF inference failed: {e}")
 
-    # 4) last resort: load base model locally on demand
+    # 4) last resort: load base locally on-demand
     try:
-        _ensure_loaded_base(req.model_id)
-        pipe = local_models[req.model_id]["pipe"]
+        _ensure_loaded_base(mid)
+        pipe = local_models[mid]["pipe"]
         out = pipe(_build_prompt(instr, req.prompt), **_gen_kwargs(cfg))
         return {"success": True, "source": "hf-local-on-demand", "response": out[0]["generated_text"].strip()}
     except Exception as e:
-        logging.error(f"Local on-demand load failed: {e}")
+        log.error(f"Local on-demand load failed: {e}")
 
-    # 5) OpenAI fallback (if configured)
+    # 5) OpenAI fallback
     if OPENAI_API_KEY:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
@@ -438,7 +421,8 @@ def run_chat(req: RunChat, session_id: str = Depends(require_session)):
 
     raise HTTPException(502, "No inference backend available")
 
-# ── Uvicorn (Railway provides PORT) ──────────────────────────────────────────
+# ── Uvicorn ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
+    # single worker avoids double-loading models in some hosts
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT","8080")))
