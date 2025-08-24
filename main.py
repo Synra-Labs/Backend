@@ -1,326 +1,210 @@
 #!/usr/bin/env python3
-import os, json, uuid, time, logging
-from typing import Dict, Any, List, Optional
+"""
+Synra Nspire Backend (main.py)
 
+• /models        → list available public HF models
+• /modify-file   → set (in-memory) chat parameters per model
+• /run           → generate text via HF Inference API, fallback to OpenAI GPT-4
+• /train         → stubbed fine-tune (with progress polling)
+"""
+import os
+import logging
+import uuid
 import requests
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Header, Query
+from typing import List, Dict, Any
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
-# Optional deps (only used if present)
-try:
-    import boto3  # for S3/R2
-except Exception:
-    boto3 = None
-try:
-    import redis
-except Exception:
-    redis = None
+from openai import OpenAI
+from transformers import Trainer, TrainingArguments, AutoTokenizer, AutoModelForCausalLM
+from datasets import Dataset
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Logging & env
+# 1) ENV + CLIENT SETUP
 # ─────────────────────────────────────────────────────────────────────────────
+load_dotenv()
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("nspire")
 
-ALLOW_ORIGINS         = os.getenv("ALLOW_ORIGINS", "*")
-RUNPOD_API_KEY        = os.getenv("RUNPOD_API_KEY")
-RUNPOD_ENDPOINT_ID    = os.getenv("RUNPOD_ENDPOINT_ID")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")
+if HF_API_TOKEN:
+    logging.info("✅ HF_API_TOKEN loaded")
+else:
+    logging.warning("⚠️ HF_API_TOKEN not set — HF inference disabled")
 
-S3_BUCKET             = os.getenv("S3_BUCKET")
-S3_ENDPOINT           = os.getenv("S3_ENDPOINT")
-AWS_REGION            = os.getenv("AWS_REGION", "auto")
-AWS_ACCESS_KEY_ID     = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    logging.error("❌ OPENAI_API_KEY is required for GPT-4 fallback")
+    raise RuntimeError("Missing OPENAI_API_KEY")
+client_openai = OpenAI(api_key=OPENAI_API_KEY)
 
-REDIS_URL             = os.getenv("REDIS_URL", "")
+# in-memory stores
+chat_cfg: Dict[str, Dict[str, Any]] = {}
+train_progress: Dict[str, Dict[str, Any]] = {}
 
-HF_API_TOKEN          = os.getenv("HF_API_TOKEN")        # optional
-HF_INFERENCE_FALLBACK = os.getenv("HF_INFERENCE_FALLBACK", "HuggingFaceH4/zephyr-7b-beta")
-
-OPENAI_API_KEY        = os.getenv("OPENAI_API_KEY")      # optional
-OPENAI_CHAT_MODEL     = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Optional clients
-# ─────────────────────────────────────────────────────────────────────────────
-s3 = None
-if boto3 and S3_BUCKET and S3_ENDPOINT and AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
-    try:
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=S3_ENDPOINT,
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            region_name=AWS_REGION,
-        )
-        log.info("S3 client ready.")
-    except Exception as e:
-        log.warning(f"S3 disabled: {e}")
-        s3 = None
-
-rdb = None
-if redis and REDIS_URL:
-    try:
-        rdb = redis.from_url(REDIS_URL)
-        rdb.ping()
-        log.info("Redis connected.")
-    except Exception as e:
-        log.warning(f"Redis disabled: {e}")
-        rdb = None
-
-# in-process fallback store (used when Redis not set)
-_mem_cfg: Dict[str, Dict[str, Any]] = {}
-_mem_models: Dict[str, Dict[str, Any]] = {}
-_mem_jobs: Dict[str, Dict[str, Any]] = {}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FastAPI & CORS
-# ─────────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="nspire API", version="1.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"] if ALLOW_ORIGINS == "*" else [ALLOW_ORIGINS],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Session (no login — per-browser header)
-# ─────────────────────────────────────────────────────────────────────────────
-def require_session(x_session_id: Optional[str] = Header(None)) -> str:
-    return x_session_id or f"anon-{uuid.uuid4()}"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Schemas
-# ─────────────────────────────────────────────────────────────────────────────
-class ModifyChat(BaseModel):
-    model_id: str = Field(..., alias="modelId")
-    temperature: float = 0.7
-    token_limit: int = Field(256, alias="tokenLimit")
-    instructions: str = Field("", alias="instructions")
-    top_p: Optional[float] = Field(None, alias="topP")
-    top_k: Optional[int]   = Field(None, alias="topK")
-    stop: Optional[List[str]] = None
-
-    model_config = {"populate_by_name": True, "protected_namespaces": ()}
-
-class RunChat(BaseModel):
-    model_id: str = Field(..., alias="modelId")
-    prompt: str
-    model_config = {"populate_by_name": True, "protected_namespaces": ()}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Storage helpers (Redis or in-memory)
-# ─────────────────────────────────────────────────────────────────────────────
-def _cfg_key(sid: str, mid: str) -> str:  return f"cfg:{sid}:{mid}"
-def _job_key(sid: str, jid: str) -> str:  return f"job:{sid}:{jid}"
-def _models_key(sid: str) -> str:         return f"models:{sid}"
-
-def _save_cfg(sid: str, mid: str, cfg: Dict[str, Any]):
-    if rdb:
-        rdb.hset(_cfg_key(sid, mid), mapping=cfg)
-    else:
-        _mem_cfg.setdefault(sid, {})[mid] = cfg
-
-def _load_cfg(sid: str, mid: str) -> Dict[str, Any]:
-    if rdb:
-        raw = rdb.hgetall(_cfg_key(sid, mid))
-        if not raw: return {}
-        return {k.decode(): (v.decode() if isinstance(v, bytes) else v) for k, v in raw.items()}
-    return _mem_cfg.get(sid, {}).get(mid, {})
-
-def _register_model(sid: str, mid: str, meta: Dict[str, Any]):
-    if rdb:
-        rdb.hset(_models_key(sid), mid, json.dumps(meta))
-    else:
-        _mem_models.setdefault(sid, {})[mid] = meta
-
-def _list_models(sid: str) -> Dict[str, Any]:
-    if rdb:
-        h = rdb.hgetall(_models_key(sid))
-        return {k.decode(): json.loads(v) for k, v in h.items()} if h else {}
-    return _mem_models.get(sid, {})
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────────────────────────────────────
+# public models (no gated repos)
 PUBLIC_MODELS = [
-    # Use HF repos that are typically available for serverless or well-known
-    "HuggingFaceH4/zephyr-7b-beta",
-    "google/gemma-2-2b-it",
-    "NousResearch/Hermes-2-Pro-Llama-3-8B",
-    "mistralai/Mistral-7B-Instruct-v0.2",
-    "tiiuae/falcon-7b-instruct",
-    "TinyLlama/TinyLlama-1.1B-Chat-v1.0",  # may not be on serverless; fallback handles it
+    "mistralai/mistral-7b",
+    "tiiuae/falcon-40b",
+    "EleutherAI/gpt-j-6B",
+    "EleutherAI/gpt-neo-2.7B",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Small helpers
+# 2) FASTAPI SETUP
 # ─────────────────────────────────────────────────────────────────────────────
-def _build_prompt(instr: str, user: str) -> str:
-    i = (instr or "").strip()
-    return f"{i}\n{user}" if i else user
+app = FastAPI(title="Ailo Forge", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-def _gen_params(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    out = {
-        "max_new_tokens": int(cfg.get("max_tokens", 256)),
-        "temperature": float(cfg.get("temperature", 0.7)),
-    }
-    if cfg.get("top_p") not in ("", None): out["top_p"] = float(cfg["top_p"])
-    if cfg.get("top_k") not in ("", None): out["top_k"] = int(cfg["top_k"])
-    return out
-
-def _hf_infer(repo_id: str, full_input: str, params: Dict[str, Any]) -> str:
-    if not HF_API_TOKEN:
-        raise RuntimeError("HF_API_TOKEN not set")
-
-    url = f"https://api-inference.huggingface.co/models/{repo_id}"
-    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-    payload = {
-        "inputs": full_input,
-        "parameters": params,
-        "options": {"wait_for_model": True},
-    }
-
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code == 404:
-        raise FileNotFoundError(f"HF 404 for repo {repo_id}")
-    r.raise_for_status()
-    data = r.json()
-    if isinstance(data, list) and data and "generated_text" in data[0]:
-        return data[0]["generated_text"]
-    if isinstance(data, dict) and "generated_text" in data:
-        return data["generated_text"]
-    # Some endpoints return {"conversation": {"generated_responses":[...]}}
-    try:
-        conv = data.get("conversation", {})
-        gen = conv.get("generated_responses", [])
-        if gen:
-            return gen[-1]
-    except Exception:
-        pass
-    return str(data)
-
-def _openai_chat(full_input: str, cfg: Dict[str, Any]) -> str:
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY not set")
-    from openai import OpenAI
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    messages = [{"role": "user", "content": full_input}]
-    resp = client.chat.completions.create(
-        model=OPENAI_CHAT_MODEL,
-        messages=messages,
-        temperature=float(cfg.get("temperature", 0.7)),
-        max_tokens=int(cfg.get("max_tokens", 256)),
-    )
-    return resp.choices[0].message.content.strip()
+@app.exception_handler(RequestValidationError)
+async def validation_error(request: Request, exc: RequestValidationError):
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Routes
+# 3) SCHEMAS
+# ─────────────────────────────────────────────────────────────────────────────
+class ModifyChat(BaseModel):
+    model_id:    str   = Field(..., alias="modelId")
+    temperature: float
+    token_limit: int   = Field(..., alias="tokenLimit")
+    instructions:str   = Field("", alias="instructions")
+    class Config:
+        allow_population_by_alias = True
+        allow_population_by_field_name = True
+
+class RunChat(BaseModel):
+    model_id: str   = Field(..., alias="modelId")
+    prompt:   str
+    class Config:
+        allow_population_by_alias = True
+        allow_population_by_field_name = True
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/")
-def health():
-    return {"ok": True, "message": "nspire API live", "hf": bool(HF_API_TOKEN), "openai": bool(OPENAI_API_KEY)}
+async def healthcheck():
+    return {"status":"ok","message":"Ailo Forge backend is live"}
 
 @app.get("/models")
-def models(session_id: str = Depends(require_session)):
-    return {"baseModels": PUBLIC_MODELS, "localModels": _list_models(session_id)}
-
-@app.get("/config")
-def get_config(model_id: str, session_id: str = Depends(require_session)):
-    return _load_cfg(session_id, model_id)
+async def list_models():
+    return {"models": PUBLIC_MODELS}
 
 @app.post("/modify-file")
-def modify(req: ModifyChat, session_id: str = Depends(require_session), prewarm: int = 0):
-    cfg = {
+async def modify_file(req: ModifyChat):
+    chat_cfg[req.model_id] = {
         "temperature": req.temperature,
-        "max_tokens": req.token_limit,
+        "max_tokens":  req.token_limit,
         "instructions": req.instructions,
-        "top_p": "" if req.top_p is None else req.top_p,
-        "top_k": "" if req.top_k is None else req.top_k,
-        "stop": json.dumps(req.stop) if req.stop else "",
     }
-    _save_cfg(session_id, req.model_id, cfg)
-    return {"success": True, "modelId": req.model_id, "prewarmed": bool(prewarm)}
-
-# (Train/progress endpoints omitted here for brevity – keep your existing ones if you’re using Runpod)
+    return {"success": True, "message": "✅ Model has been modified!"}
 
 @app.post("/run")
-def run_chat(req: RunChat, session_id: str = Depends(require_session)):
-    cfg  = _load_cfg(session_id, req.model_id)
-    instr = cfg.get("instructions", "")
-    full_input = _build_prompt(instr, req.prompt)
-    params = _gen_params(cfg)
+async def run_chat(req: RunChat):
+    cfg = chat_cfg.get(req.model_id, {})
+    temp    = cfg.get("temperature", 0.7)
+    max_tok = cfg.get("max_tokens", 150)
+    instr   = cfg.get("instructions", "")
 
-    # 1) Try HF serverless
+    # build full prompt
+    full_input = instr.strip()
+    if full_input:
+        full_input += "\n" + req.prompt
+    else:
+        full_input = req.prompt
+
+    # 1) HF Inference
     if HF_API_TOKEN:
-        repo = req.model_id
+        hf_url = f"https://api-inference.huggingface.co/models/{req.model_id}"
+        headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+        payload = {
+            "inputs": full_input,
+            "parameters": {"temperature": temp, "max_new_tokens": max_tok},
+        }
         try:
-            text = _hf_infer(repo, full_input, params)
-            return {"success": True, "source": f"hf:{repo}", "response": text}
-        except FileNotFoundError:
-            log.warning(f"HF 404 for repo {repo} — trying fallback {HF_INFERENCE_FALLBACK}")
-            try:
-                text = _hf_infer(HF_INFERENCE_FALLBACK, full_input, params)
-                return {"success": True, "source": f"hf:{HF_INFERENCE_FALLBACK}", "response": text}
-            except Exception as e2:
-                log.warning(f"HF inference failed (fallback): {e2}")
+            r = requests.post(hf_url, headers=headers, json=payload, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            # extract generated_text
+            if isinstance(data, list) and "generated_text" in data[0]:
+                text = data[0]["generated_text"]
+            elif isinstance(data, dict) and "generated_text" in data:
+                text = data["generated_text"]
+            else:
+                text = data.get("generated_text", str(data))
+            return {"success": True, "response": text}
         except Exception as e:
-            log.warning(f"HF inference failed: {e}")
+            logging.warning(f"HF Inference error for {req.model_id}: {e} — falling back to OpenAI")
 
-    # 2) OpenAI fallback (v1 only)
-    if OPENAI_API_KEY:
-        try:
-            text = _openai_chat(full_input, cfg)
-            return {"success": True, "source": f"openai:{OPENAI_CHAT_MODEL}", "response": text}
-        except Exception as e:
-            log.error(f"OpenAI v1 failed: {e}")
-
-    # 3) Nothing worked
-    raise HTTPException(
-        status_code=502,
-        detail="No remote backend available. Set HF_API_TOKEN with access to the repo or OPENAI_API_KEY.",
-    )
-
-# Optional: simple download manifest/zip endpoints for your Downloads page.
-@app.get("/download_manifest")
-def download_manifest(model_id: str, sid: Optional[str] = Query(None)):
-    # This sample assumes your fine-tunes are archived in S3/R2 under models/<sid>/<job>/...
-    # Implement your own mapping. If no S3 configured, return empty.
-    if not s3:
-        return {"files": []}
-    # Example placeholder; customize to your path layout.
-    prefix = f"models/{sid}/{model_id}/"
+    # 2) OpenAI fallback
+    messages = []
+    if instr:
+        messages.append({"role":"system","content":instr})
+    messages.append({"role":"user","content":req.prompt})
     try:
-        resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
-        files = []
-        for obj in resp.get("Contents", []):
-            key = obj["Key"]
-            head = s3.head_object(Bucket=S3_BUCKET, Key=key)
-            size = int(head.get("ContentLength", 0))
-            url = s3.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": S3_BUCKET, "Key": key},
-                ExpiresIn=3600,
-            )
-            files.append({"key": key, "url": url, "size": size})
-        return {"files": files}
+        resp = client_openai.chat.completions.create(
+            model="gpt-4",
+            messages=messages,
+            temperature=temp,
+            max_tokens=max_tok,
+        )
+        text = resp.choices[0].message.content.strip()
+        return {"success": True, "response": text}
     except Exception as e:
-        log.warning(f"download_manifest error: {e}")
-        return {"files": []}
+        logging.error(f"OpenAI GPT-4 error: {e}")
+        raise HTTPException(502, detail="Both HF and OpenAI calls failed.")
 
-@app.get("/download_zip")
-def download_zip(model_id: str, sid: Optional[str] = Query(None)):
-    # For large sets, you should stream a server-side zip/tar; here we just signal.
-    if not s3:
-        raise HTTPException(404, "No storage configured")
-    return {"message": "Implement streaming/tarball here for your storage layout."}
+@app.post("/train")
+async def train_model(
+    repo_id: str = Form(...),
+    files: List[UploadFile] = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    texts = []
+    for f in files:
+        b = await f.read()
+        if not b.startswith((b"\xFF\xD8", b"\x89PNG")):
+            texts.append(b.decode("utf-8", errors="ignore"))
+    if not texts:
+        raise HTTPException(400, detail="No valid text provided")
+
+    job = str(uuid.uuid4())
+    train_progress[job] = {"percent": 0, "status": "in_progress"}
+    background_tasks.add_task(_run_training, job, repo_id, texts)
+    return {"job_id": job, "status": "training_started"}
+
+@app.get("/progress/{job_id}")
+async def get_progress(job_id: str):
+    if job_id not in train_progress:
+        raise HTTPException(404, detail="Job not found")
+    return train_progress[job_id]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Uvicorn entry
+# 5) BACKGROUND TRAINING STUB
+# ─────────────────────────────────────────────────────────────────────────────
+def _run_training(job_id: str, repo_id: str, texts: List[str]):
+    try:
+        tok = AutoTokenizer.from_pretrained(repo_id)
+        mod = AutoModelForCausalLM.from_pretrained(repo_id)
+        ds  = Dataset.from_dict({"text": texts})
+        ds  = ds.map(lambda x: tok(x["text"], truncation=True, max_length=128), batched=True)
+
+        out_dir = f"models/ft-{job_id}"
+        args = TrainingArguments(output_dir=out_dir, num_train_epochs=3, per_device_train_batch_size=2, push_to_hub=False)
+        tr = Trainer(mod, args, train_dataset=ds, tokenizer=tok)
+        tr.train(); tr.save_model(out_dir)
+
+        train_progress[job_id] = {"percent": 100, "status": "completed"}
+    except:
+        logging.exception("Training failed")
+        train_progress[job_id] = {"percent": 0, "status": "failed"}
+
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=True)
