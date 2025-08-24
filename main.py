@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Nspire API (FastAPI) — chat, config(modify), optional training stub, downloads.
+Nspire API (FastAPI) — config(modify), chat, simple train/progress, optional downloads.
 
-Env you can set on Railway:
-  - OPENAI_API_KEY           # enable OpenAI fallback
-  - HF_API_TOKEN             # enable Hugging Face Hosted Inference
-  - FORCE_REMOTE=1           # recommended on small hosts: skip local model loads
-  - ALLOW_ORIGINS=*          # CORS (set to your Vercel domain in prod)
+ENV (Railway):
+  OPENAI_API_KEY            # enable OpenAI fallback (recommended)
+  HF_API_TOKEN              # enable Hugging Face Hosted Inference
+  FORCE_REMOTE=1            # recommended for small hosts (skip local loads)
+  ALLOW_ORIGINS=*           # CORS (restrict to Vercel domain in prod)
 
-Optional (for S3/R2 downloads after training):
-  - S3_BUCKET, S3_ENDPOINT, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+Optional for S3/R2 downloads after training:
+  S3_BUCKET, S3_ENDPOINT, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 """
 
 import os, io, json, uuid, time, logging
@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-# Optional local loading (disabled when FORCE_REMOTE=1)
+# Optional local-loading deps (disabled when FORCE_REMOTE=1)
 try:
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
@@ -38,7 +38,7 @@ except Exception:
 
 logging.basicConfig(level=logging.INFO)
 
-# ─────────── Env
+# ── ENV ──────────────────────────────────────────────────────────────────────
 ALLOW_ORIGINS  = os.getenv("ALLOW_ORIGINS", "*")
 FORCE_REMOTE   = os.getenv("FORCE_REMOTE", "0") == "1"
 HF_API_TOKEN   = os.getenv("HF_API_TOKEN", "")
@@ -53,7 +53,7 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 DEVICE = "cuda" if (torch and torch.cuda.is_available()) else "cpu"
 CACHE_DIR = "/tmp/nspire_models"; os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Optional S3 client
+# S3 client (optional)
 s3 = None
 if S3_BUCKET and boto3:
     s3 = boto3.client(
@@ -64,13 +64,13 @@ if S3_BUCKET and boto3:
         region_name=(None if AWS_REGION == "auto" else AWS_REGION),
     )
 
-# ─────────── In-memory stores (per-container)
+# ── In-memory stores ─────────────────────────────────────────────────────────
 CONFIGS: Dict[str, Dict[str, Dict[str, Any]]] = {}      # session_id -> model_id -> cfg
 LOCAL_MODELS: Dict[str, Any] = {}                        # model_id -> {"pipe":..., "meta":...}
 TRAINED: Dict[str, Dict[str, Any]] = {}                  # session_id -> {ft_id: meta}
 JOBS: Dict[str, Dict[str, Any]] = {}                     # session_id -> {job_id: {...}}
 
-# ─────────── Curated base models (label + HF repo id)
+# ── Curated base models (good remote candidates) ─────────────────────────────
 BASE_MODELS = [
     {"label":"TinyLlama-1.1B-Chat",         "repo":"TinyLlama/TinyLlama-1.1B-Chat-v1.0",   "public": True},
     {"label":"Phi-3-mini-4k-instruct",      "repo":"microsoft/Phi-3-mini-4k-instruct",     "public": True},
@@ -86,8 +86,8 @@ BASE_MODELS = [
     {"label":"LLaMA-3-8B-Instruct (gated)", "repo":"meta-llama/Meta-Llama-3-8B-Instruct",  "public": False},
 ]
 
-# ─────────── FastAPI
-app = FastAPI(title="Nspire API", version="1.3.0")
+# ── FastAPI ──────────────────────────────────────────────────────────────────
+app = FastAPI(title="Nspire API", version="1.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"] if ALLOW_ORIGINS == "*" else [ALLOW_ORIGINS],
@@ -96,11 +96,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─────────── Session (no login; per-browser header)
+# ── Session (no login) ──────────────────────────────────────────────────────
 def get_session_id(x_session_id: Optional[str] = Header(None)) -> str:
     return x_session_id or f"anon-{uuid.uuid4()}"
 
-# ─────────── Schemas (pydantic v2 compatible)
+# ── Schemas (pydantic v2) ───────────────────────────────────────────────────
 class ModifyChat(BaseModel):
     model_id: str = Field(..., alias="modelId")
     temperature: float = 0.7
@@ -116,7 +116,7 @@ class RunChat(BaseModel):
     prompt: str
     model_config = {"populate_by_name": True, "protected_namespaces": ()}
 
-# ─────────── Helpers
+# ── Helpers ─────────────────────────────────────────────────────────────────
 def _defaults() -> Dict[str, Any]:
     return {"temperature":0.7,"max_tokens":256,"instructions":"","top_p":"","top_k":"","stop":""}
 
@@ -141,7 +141,7 @@ def _gen_kwargs(cfg: Dict[str,Any]) -> Dict[str,Any]:
     if cfg.get("top_k") not in ("", None): out["top_k"] = int(cfg["top_k"])
     return out
 
-# HF hosted inference with robust behavior (wait_for_model & clean 404 handling)
+# Hugging Face hosted inference (robust; 404 handled; waits for cold start)
 def hf_remote_infer(mid: str, prompt: str, cfg: Dict[str,Any]) -> Optional[str]:
     if not HF_API_TOKEN:
         return None
@@ -158,7 +158,7 @@ def hf_remote_infer(mid: str, prompt: str, cfg: Dict[str,Any]) -> Optional[str]:
         }
         r = requests.post(url, headers=headers, json=payload, timeout=90)
         if r.status_code == 404:
-            logging.warning(f"HF 404 for repo {mid} — check repo id / token access.")
+            logging.warning(f"HF 404 for repo {mid} — repo ID / gating / token access.")
             return None
         r.raise_for_status()
         data = r.json()
@@ -166,51 +166,42 @@ def hf_remote_infer(mid: str, prompt: str, cfg: Dict[str,Any]) -> Optional[str]:
             return data[0]["generated_text"]
         if isinstance(data, dict) and "generated_text" in data:
             return data["generated_text"]
+        # Some pipelines return [{"generated_text": "..."}], others raw; just stringify fallback
         return str(data)
     except Exception as e:
         logging.warning(f"HF inference failed for {mid}: {e}")
         return None
 
-# OpenAI fallback that works with both v1 and legacy v0 SDKs
+# OpenAI fallback via RAW REST (works regardless of SDK version)
 def openai_fallback_chat(prompt_only: str, sys: str, cfg: Dict[str,Any]) -> Optional[str]:
     if not OPENAI_API_KEY:
         return None
     try:
-        os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY  # avoid passing kwargs like proxies
-        # Try modern SDK (openai>=1.x)
-        try:
-            from openai import OpenAI  # type: ignore
-            client = OpenAI()
-            messages = []
-            if sys: messages.append({"role":"system","content":sys})
-            messages.append({"role":"user","content":prompt_only})
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                temperature=float(cfg.get("temperature",0.7)),
-                max_tokens=int(cfg.get("max_tokens",256)),
-            )
-            return resp.choices[0].message.content.strip()
-        except Exception as e_v1:
-            logging.warning(f"OpenAI v1 path failed ({e_v1}), trying legacy v0...")
-            # Legacy SDK (openai<1.0)
-            import openai as openai_v0  # type: ignore
-            openai_v0.api_key = OPENAI_API_KEY
-            messages = []
-            if sys: messages.append({"role":"system","content":sys})
-            messages.append({"role":"user","content":prompt_only})
-            resp = openai_v0.ChatCompletion.create(
-                model="gpt-3.5-turbo-0125",
-                messages=messages,
-                temperature=float(cfg.get("temperature",0.7)),
-                max_tokens=int(cfg.get("max_tokens",256)),
-            )
-            return resp.choices[0].message["content"].strip()
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        messages = []
+        if sys: messages.append({"role":"system","content":sys})
+        messages.append({"role":"user","content":prompt_only})
+        body = {
+            "model": "gpt-4o-mini",
+            "messages": messages,
+            "temperature": float(cfg.get("temperature",0.7)),
+            "max_tokens": int(cfg.get("max_tokens",256)),
+        }
+        r = requests.post(url, headers=headers, json=body, timeout=60)
+        if r.status_code >= 400:
+            logging.error(f"OpenAI REST error {r.status_code}: {r.text[:400]}")
+            return None
+        data = r.json()
+        return data["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logging.error(f"OpenAI fallback failed: {e}")
+        logging.error(f"OpenAI fallback failed (REST): {e}")
         return None
 
-# Local loading utilities (used only when FORCE_REMOTE=0)
+# Local loading (used only when FORCE_REMOTE=0)
 def _ensure_loaded_base(hf_id: str):
     if FORCE_REMOTE:
         raise RuntimeError("FORCE_REMOTE=1: local load disabled")
@@ -222,10 +213,10 @@ def _ensure_loaded_base(hf_id: str):
     tok = AutoTokenizer.from_pretrained(hf_id, use_fast=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     model = AutoModelForCausalLM.from_pretrained(
-        hf_id, device_map="auto" if DEVICE=="cuda" else None
+        hf_id, device_map="auto" if (torch and DEVICE=="cuda") else None
     )
     model.eval()
-    pipe = pipeline("text-generation", model=model, tokenizer=tok, device=(0 if DEVICE=="cuda" else -1))
+    pipe = pipeline("text-generation", model=model, tokenizer=tok, device=(0 if (torch and DEVICE=="cuda") else -1))
     LOCAL_MODELS[hf_id] = {"pipe": pipe, "meta":{"type":"base"}}
 
 def _download_s3_prefix(local_dir: str, bucket: str, prefix: str):
@@ -263,14 +254,14 @@ def _ensure_loaded_finetune(model_id: str, meta: Dict[str, Any]):
     tok = AutoTokenizer.from_pretrained(base, use_fast=True)
     if tok.pad_token is None: tok.pad_token = tok.eos_token
     base_model = AutoModelForCausalLM.from_pretrained(
-        base, device_map="auto" if DEVICE=="cuda" else None
+        base, device_map="auto" if (torch and DEVICE=="cuda") else None
     )
     model = PeftModel.from_pretrained(base_model, local_dir)
     model.eval()
-    pipe = pipeline("text-generation", model=model, tokenizer=tok, device=(0 if DEVICE=="cuda" else -1))
+    pipe = pipeline("text-generation", model=model, tokenizer=tok, device=(0 if (torch and DEVICE=="cuda") else -1))
     LOCAL_MODELS[model_id] = {"pipe": pipe, "meta":{"type":"lora","base":base}}
 
-# ─────────── Routes
+# ── Routes ───────────────────────────────────────────────────────────────────
 @app.get("/")
 def health():
     return {"ok": True, "device": DEVICE, "force_remote": FORCE_REMOTE, "message": "Nspire API live"}
@@ -300,7 +291,7 @@ def get_config(model_id: str = Query(...), download: bool = Query(False), sid: s
     return {"modelId": model_id, "config": cfg}
 
 @app.post("/config")
-@app.post("/modify-file")  # alias for your existing frontend
+@app.post("/modify-file")  # alias for existing frontend
 def post_config(req: ModifyChat, prewarm: bool = Query(False), sid: str = Depends(get_session_id)):
     cfg = {
         "temperature": req.temperature,
@@ -328,7 +319,7 @@ def run(req: RunChat, sid: str = Depends(get_session_id)):
     prompt_only = req.prompt
     full_prompt = _build_prompt(sys, prompt_only)
 
-    # Remote-only on small hosts
+    # Remote-first on small hosts
     if FORCE_REMOTE:
         text = hf_remote_infer(mid, full_prompt, cfg)
         if text is not None:
@@ -338,7 +329,7 @@ def run(req: RunChat, sid: str = Depends(get_session_id)):
             return {"success": True, "source": "openai_fallback", "response": text}
         raise HTTPException(502, detail="No remote backend available. Set HF_API_TOKEN or OPENAI_API_KEY.")
 
-    # Try local fine-tune for this session
+    # Local fine-tune for this session?
     meta = TRAINED.get(sid, {}).get(mid)
     if meta:
         try:
@@ -372,14 +363,14 @@ def run(req: RunChat, sid: str = Depends(get_session_id)):
     except Exception as e:
         logging.error(f"Local on-demand load failed: {e}")
 
-    # OpenAI fallback
+    # OpenAI REST
     text = openai_fallback_chat(prompt_only, sys, cfg)
     if text is not None:
         return {"success": True, "source": "openai_fallback", "response": text}
 
     raise HTTPException(502, detail="No inference backend available. Provide HF_API_TOKEN or OPENAI_API_KEY.")
 
-# ─────────── Minimal training stub (registers a fake finetune so the UI flows)
+# ── Minimal training stub (keeps UI flow) ────────────────────────────────────
 @app.post("/train")
 async def train(
     base_model_id: str = Form(...),
@@ -396,10 +387,10 @@ async def train(
 
     job_id = str(uuid.uuid4())
     JOBS.setdefault(sid, {})[job_id] = {"status":"in_progress", "ts": time.time()}
-    # Create an ft id & placeholder meta (your real trainer should overwrite s3_uri later)
+    # Register placeholder fine-tune so UI can use ft-... id
     ft_id = f"ft-{job_id}"
     TRAINED.setdefault(sid, {})[ft_id] = {
-        "s3_uri": f"s3://{S3_BUCKET}/models/{sid}/{ft_id}/",  # placeholder prefix
+        "s3_uri": f"s3://{S3_BUCKET}/models/{sid}/{ft_id}/",  # placeholder
         "base_model_id": base_model_id,
         "type": "lora",
         "created": int(time.time()),
@@ -411,7 +402,7 @@ def progress(job_id: str, sid: str = Depends(get_session_id)):
     job = JOBS.get(sid, {}).get(job_id)
     if not job:
         raise HTTPException(404, "Job not found")
-    # Simulate quick completion for demo
+    # simulate quick completion
     if time.time() - job["ts"] > 2:
         job["status"] = "completed"
     ft_id = f"ft-{job_id}"
@@ -440,7 +431,7 @@ def download_model(model_id: str = Query(...), sid: str = Depends(get_session_id
         items.append({"key": key, "url": url, "size": obj.get("Size", 0)})
     return {"model_id": model_id, "files": items}
 
-# ─────────── Run
+# ── Uvicorn ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT","8080")))
