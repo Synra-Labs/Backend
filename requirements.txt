@@ -1,12 +1,11 @@
-fastapi 
-uvicorn 
-pydantic 
-requests 
-boto3 
-redis
-transformers 
-datasets 
-accelerate 
-peft 
-bitsandbytes
-openai
+--extra-index-url https://download.pytorch.org/whl/cpu
+fastapi==0.111.0
+uvicorn==0.30.1
+pydantic==2.7.4
+requests==2.32.3
+boto3==1.34.155
+redis==5.0.6
+transformers==4.41.2
+peft==0.11.1
+openai==1.40.1
+torch==2.3.1
